@@ -171,4 +171,46 @@ CREATE TABLE IF NOT EXISTS save_exports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_exports_save ON save_exports(save_id);
+
+-- 生态修复项目：同区域同季节内争夺有限季节资源。
+-- UNIQUE 约束保证并发修复不可重复加成：
+--   区域级措施（scope_species_id='*'）每区域每季每种措施至多一次；
+--   物种级措施每区域每季每物种每种措施至多一次。
+CREATE TABLE IF NOT EXISTS restoration_projects (
+  id TEXT PRIMARY KEY,
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  season TEXT NOT NULL,
+  site_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  scope_species_id TEXT NOT NULL,
+  target_species_id TEXT NOT NULL,
+  effort INTEGER NOT NULL,
+  efficiency REAL NOT NULL,
+  day INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(save_id, year, season, site_id, action, scope_species_id),
+  UNIQUE(save_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_restoration_lookup
+  ON restoration_projects(save_id, year, season, site_id);
+
+-- 历史命令流水：成功提交的命令按序追加，用于操作审计与确定性重放。
+CREATE TABLE IF NOT EXISTS command_log (
+  sequence INTEGER PRIMARY KEY,
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  command_json TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  event_message TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_command_log_save
+  ON command_log(save_id, sequence);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_command_log_idempotency
+  ON command_log(save_id, idempotency_key);
 `;

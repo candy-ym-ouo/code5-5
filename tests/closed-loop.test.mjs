@@ -82,9 +82,70 @@ try {
   assert.equal(world.season, 'spring');
   assert.equal(world.phase, 'active');
 
+  // 生态修复：季节资源竞争、区域+物种效果与不可重复加成。
+  const foothill = () => world.sites.find((site) => site.id === 'foothill');
+  assert.equal(foothill().restoration.capacity, 6);
+  assert.equal(foothill().restoration.remaining, 6);
+
+  await send({ type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'reduce_disturbance' });
+  assert.equal(foothill().restoration.effortUsed, 3);
+  assert.equal(foothill().restoration.remaining, 3);
+  assert.ok(foothill().restoration.nextEfficiency < 1, '后续措施应面对更低的竞争效率');
+  const firstEfficiency = foothill().restoration.projects[0].efficiency;
+  assert.equal(firstEfficiency, 1);
+
+  await send({ type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'protect_seed_bank' });
+  const secondEfficiency = foothill().restoration.projects[1].efficiency;
+  assert.ok(secondEfficiency < firstEfficiency, '争夺同一季节资源导致边际效率下降');
+
+  // 重复的区域性措施不得叠加收益。
+  const duplicateKey = crypto.randomUUID();
+  {
+    const response = await fetch(`${baseUrl}/api/save/${world.saveId}/commands`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        expectedRevision: world.revision,
+        idempotencyKey: duplicateKey,
+        command: { type: 'RESTORE_HABITAT', speciesId: 'orychophragmus-violaceus', action: 'reduce_disturbance' }
+      })
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json();
+    assert.equal(body.code, 'RESTORATION_ALREADY_PLANNED');
+  }
+
+  // 容量不足时整体回滚：已投入 5 点，湿生带需 4 点（且不在溪谷），样方需 2 点同样超额。
+  {
+    const response = await fetch(`${baseUrl}/api/save/${world.saveId}/commands`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        expectedRevision: world.revision,
+        idempotencyKey: crypto.randomUUID(),
+        command: { type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'establish_plot' }
+      })
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json();
+    assert.equal(body.code, 'RESTORATION_CAPACITY_EXHAUSTED');
+  }
+
+  // 历史命令可重放，重放结果与当前权威状态逐表一致。
+  {
+    const history = await api(`/api/save/${world.saveId}/history`);
+    assert.ok(history.commands.length > 40);
+    assert.ok(history.commands.some((entry) => entry.command.type === 'RESTORE_HABITAT'));
+    const replay = await api(`/api/save/${world.saveId}/replay`, { method: 'POST' });
+    assert.equal(replay.commandsReplayed, history.commands.length);
+    assert.equal(replay.match, true, JSON.stringify(replay.firstDifference));
+    assert.equal(replay.stateMatch, true);
+    assert.equal(replay.firstDifference, null);
+  }
+
   const report = await api(`/api/save/${world.saveId}/report/1`);
   assert.equal(report.year, 1);
-  console.log('Closed-loop E2E passed: create -> observe -> wrong sample -> four seasons -> report -> year 2');
+  console.log('Closed-loop E2E passed: create -> observe -> wrong sample -> four seasons -> report -> year 2 -> restoration competition/dedup -> replay');
 
   async function waitForServer() {
     const deadline = Date.now() + 15_000;

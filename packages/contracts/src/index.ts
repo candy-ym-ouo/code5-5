@@ -28,6 +28,14 @@ export type LeafTexture = (typeof LEAF_TEXTURES)[number];
 export const SAMPLE_METHODS = ['photo', 'rubbing', 'litter', 'cutting'] as const;
 export type SampleMethod = (typeof SAMPLE_METHODS)[number];
 
+export const RESTORATION_ACTIONS = [
+  'reduce_disturbance',
+  'protect_seed_bank',
+  'restore_wetland',
+  'establish_plot'
+] as const;
+export type RestorationAction = (typeof RESTORATION_ACTIONS)[number];
+
 const ObservationValuesSchema = z.object({
   phenology: z.enum(PHENOLOGY_STAGES),
   leafTexture: z.enum(LEAF_TEXTURES),
@@ -56,7 +64,7 @@ export const CommandSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('RESTORE_HABITAT'),
     speciesId: z.string().min(1),
-    action: z.enum(['reduce_disturbance', 'protect_seed_bank', 'restore_wetland', 'establish_plot'])
+    action: z.enum(RESTORATION_ACTIONS)
   }),
   z.object({ type: z.literal('END_SEASON') }),
   z.object({ type: z.literal('BEGIN_NEXT_SEASON') }),
@@ -100,6 +108,26 @@ export interface CatalogMeta {
   species: Array<z.infer<typeof PublicSpeciesSchema>>;
 }
 
+export interface RestorationProjectSnapshot {
+  sequence: number;
+  action: RestorationAction;
+  label: string;
+  targetSpeciesId: string;
+  targetSpeciesName: string;
+  effort: number;
+  efficiency: number;
+  day: number;
+  createdAt: string;
+}
+
+export interface SiteRestorationSnapshot {
+  capacity: number;
+  effortUsed: number;
+  remaining: number;
+  nextEfficiency: number;
+  projects: RestorationProjectSnapshot[];
+}
+
 export interface SiteSnapshot {
   id: SiteId;
   name: string;
@@ -117,6 +145,7 @@ export interface SiteSnapshot {
     windSpeed: number;
     disturbance: number;
   };
+  restoration: SiteRestorationSnapshot;
   species: SpeciesSnapshot[];
 }
 
@@ -179,6 +208,36 @@ export interface AnnualReview {
   incorrectSamples: number;
   recommendations: string[];
   restorationUnlocked: boolean;
+  restorationProjects: Array<{
+    siteId: SiteId;
+    siteName: string;
+    action: RestorationAction;
+    label: string;
+    targetSpeciesName: string;
+    count: number;
+    effort: number;
+  }>;
+}
+
+export interface CommandHistoryEntry {
+  sequence: number;
+  revision: number;
+  command: GameCommand;
+  idempotencyKey: string;
+  eventType: string;
+  eventMessage: string;
+  createdAt: string;
+}
+
+export interface ReplayResult {
+  saveId: string;
+  commandsReplayed: number;
+  revisionMatch: boolean;
+  yearMatch: boolean;
+  seasonMatch: boolean;
+  stateMatch: boolean;
+  match: boolean;
+  firstDifference: { table: string; expected: unknown; actual: unknown } | null;
 }
 
 export interface WorldSnapshot {
@@ -229,6 +288,31 @@ export const SEASON_LABELS: Record<Season, string> = {
   summer: '夏',
   autumn: '秋',
   winter: '冬'
+};
+
+export const RESTORATION_LABELS: Record<RestorationAction, string> = {
+  reduce_disturbance: '降低区域干扰',
+  protect_seed_bank: '保留种子区',
+  restore_wetland: '恢复湿生带',
+  establish_plot: '设置长期观察样方'
+};
+
+/** 每项措施占用的季节修复资源（工日/物料）。 */
+export const RESTORATION_EFFORT: Record<RestorationAction, number> = {
+  reduce_disturbance: 3,
+  protect_seed_bank: 2,
+  restore_wetland: 4,
+  establish_plot: 2
+};
+
+/** 每区域每季节的修复资源总容量。 */
+export const RESTORATION_SEASON_CAPACITY = 6;
+
+export const RESTORATION_DESCRIPTIONS: Record<RestorationAction, string> = {
+  reduce_disturbance: '全区域围栏与巡护：当季降低干扰，并在季末惠及区域内全部物种',
+  protect_seed_bank: '针对单一物种围护种子库：仅增强目标物种的越冬补给',
+  restore_wetland: '仅溪谷湿地可执行：区域水文恢复，季末惠及区域内全部湿生物种',
+  establish_plot: '针对目标物种设立长期样方：小幅改善目标物种，季末轻微惠及全区域'
 };
 
 export const SLOT_LABELS = ['晨', '午', '暮'];

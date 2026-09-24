@@ -168,6 +168,16 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json(result);
   });
 
+  app.get('/api/save/:saveId/history', requireSession, (req, res) => {
+    res.json({
+      commands: service.getCommandHistory(res.locals.sessionId as string, parameter(req, 'saveId'))
+    });
+  });
+
+  app.post('/api/save/:saveId/replay', requireSession, (req, res) => {
+    res.json(service.replayFromHistory(res.locals.sessionId as string, parameter(req, 'saveId')));
+  });
+
   app.post('/api/save/:saveId/export', requireSession, (req, res) => {
     res.json(service.exportSave(res.locals.sessionId as string, parameter(req, 'saveId')));
   });

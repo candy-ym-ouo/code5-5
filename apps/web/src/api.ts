@@ -2,9 +2,11 @@ import type {
   AnnualReview,
   ApiErrorShape,
   CatalogMeta,
+  CommandHistoryEntry,
   CommandRequest,
   GameCommand,
   JournalEntry,
+  ReplayResult,
   Season,
   SiteId,
   SpeciesSnapshot,
@@ -102,6 +104,12 @@ export const api = {
     request<AnnualReview>(`/api/save/${saveId}/report/${year}`),
   exportSave: (saveId: string) =>
     request<{ token: string; expiresAt: string }>(`/api/save/${saveId}/export`, {
+      method: 'POST'
+    }),
+  getHistory: (saveId: string) =>
+    request<{ commands: CommandHistoryEntry[] }>(`/api/save/${saveId}/history`),
+  replay: (saveId: string) =>
+    request<ReplayResult>(`/api/save/${saveId}/replay`, {
       method: 'POST'
     }),
   importSave: (token: string) =>

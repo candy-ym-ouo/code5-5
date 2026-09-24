@@ -103,6 +103,22 @@ export function ReportPage() {
           </ol>
         </div>
       </section>
+
+      {data.restorationProjects.length > 0 && (
+        <section className="document-section">
+          <p className="eyebrow">RESTORATION LEDGER</p>
+          <h2>本年度修复台账</h2>
+          <p className="helper-text">同区域同季节的措施争夺修复资源，重复措施不叠加收益；区域级措施的协同收益在季末结算。</p>
+          <ul className="insight-list">
+            {data.restorationProjects.map((project) => (
+              <li key={`${project.siteId}-${project.action}-${project.targetSpeciesName}`}>
+                {project.siteName} · {project.label}（目标：{project.targetSpeciesName}）
+                —— {project.count} 次，共投入 {project.effort} 点季节资源
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
     </div>
   );
 }

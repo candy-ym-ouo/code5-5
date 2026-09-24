@@ -1,11 +1,17 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
+  RESTORATION_ACTIONS,
+  RESTORATION_DESCRIPTIONS,
+  RESTORATION_EFFORT,
+  RESTORATION_LABELS,
   SEASON_LABELS,
   SLOT_LABELS,
   type GameCommand,
+  type RestorationAction,
   type SampleMethod,
-  type SpeciesSnapshot
+  type SpeciesSnapshot,
+  type WorldSnapshot
 } from '@shanhai/contracts';
 import { useGame } from '../game-context.tsx';
 import { EnvironmentForm, ObservationForm } from '../components/ObservationForm.tsx';
@@ -31,7 +37,7 @@ export function PlayPage() {
   const { world, execute, pending } = useGame();
   const currentSite = world.sites.find((site) => site.current) ?? world.sites[0]!;
   const [selectedSpeciesId, setSelectedSpeciesId] = useState(currentSite.species[0]?.id ?? '');
-  const [restoreAction, setRestoreAction] = useState<'reduce_disturbance' | 'protect_seed_bank' | 'restore_wetland' | 'establish_plot'>('reduce_disturbance');
+  const [restoreAction, setRestoreAction] = useState<RestorationAction>('reduce_disturbance');
 
   useEffect(() => {
     if (!currentSite.species.some((species) => species.id === selectedSpeciesId)) {
@@ -233,30 +239,17 @@ export function PlayPage() {
             </section>
 
             {world.restorationUnlocked && selectedSpecies && (
-              <section className="restoration-card">
-                <div>
-                  <p className="eyebrow">RESTORATION UNLOCKED</p>
-                  <h2>把年报结论变成行动</h2>
-                  <p>修复行动消耗 2 个行动点，影响会在季末或下一年度显现。</p>
-                </div>
-                <label>
-                  <span>修复方式</span>
-                  <select value={restoreAction} onChange={(event) => setRestoreAction(event.target.value as typeof restoreAction)}>
-                    <option value="reduce_disturbance">降低区域干扰</option>
-                    <option value="protect_seed_bank">保留种子区</option>
-                    <option value="restore_wetland" disabled={currentSite.id !== 'stream_valley'}>恢复湿生带（仅溪谷）</option>
-                    <option value="establish_plot">设置长期观察样方</option>
-                  </select>
-                </label>
-                <button
-                  className="button button-secondary"
-                  type="button"
-                  disabled={pending || world.actionPoints < 2}
-                  onClick={() => void run({ type: 'RESTORE_HABITAT', speciesId: selectedSpecies.id, action: restoreAction })}
-                >
-                  执行修复
-                </button>
-              </section>
+              <RestorationCard
+                key={`${currentSite.id}-${world.year}-${world.season}`}
+                site={currentSite}
+                action={restoreAction}
+                onActionChange={setRestoreAction}
+                busy={pending}
+                actionPoints={world.actionPoints}
+                onExecute={(nextAction) =>
+                  run({ type: 'RESTORE_HABITAT', speciesId: selectedSpecies.id, action: nextAction })
+                }
+              />
             )}
 
             <div className="end-season-bar">
@@ -308,4 +301,82 @@ function weatherSymbol(weather: string): string {
 
 function weatherLabel(weather: string): string {
   return ({ sunny: '晴', cloudy: '多云', overcast: '阴', light_rain: '小雨', heavy_rain: '大雨', fog: '雾', snow: '雪' } as Record<string, string>)[weather] ?? weather;
+}
+
+interface RestorationCardProps {
+  site: WorldSnapshot['sites'][number];
+  action: RestorationAction;
+  onActionChange: (action: RestorationAction) => void;
+  busy: boolean;
+  actionPoints: number;
+  onExecute: (action: RestorationAction) => void;
+}
+
+function RestorationCard({ site, action, onActionChange, busy, actionPoints, onExecute }: RestorationCardProps) {
+  const budget = site.restoration;
+  const effort = RESTORATION_EFFORT[action];
+  const affordable = budget.remaining >= effort;
+  const wetlandLocked = action === 'restore_wetland' && site.id !== 'stream_valley';
+  const usedActions = new Set(budget.projects.map((project) => project.action));
+  const alreadyPlanned = usedActions.has(action);
+  const disabled = busy || actionPoints < 2 || !affordable || wetlandLocked || alreadyPlanned;
+  const denyReason = wetlandLocked
+    ? '恢复湿生带只能在溪谷湿地执行'
+    : alreadyPlanned
+      ? '本季已在该区域执行过该措施，重复修复不叠加收益'
+      : !affordable
+        ? `本季修复资源不足（剩余 ${budget.remaining} / 需要 ${effort}）`
+        : actionPoints < 2
+          ? '需要 2 个行动点'
+          : null;
+
+  return (
+    <section className="restoration-card">
+      <div>
+        <p className="eyebrow">RESTORATION UNLOCKED</p>
+        <h2>把年报结论变成行动</h2>
+        <p>同区域同季节的措施争夺有限修复资源，后执行的措施竞争效率更低；重复措施不会叠加收益。</p>
+      </div>
+
+      <div className="restoration-budget" aria-label={`本季修复资源 ${budget.remaining}/${budget.capacity}`}>
+        <div className="restoration-budget-head">
+          <span>本季修复资源 · {site.name}</span>
+          <strong>{budget.remaining}/{budget.capacity}</strong>
+        </div>
+        <div className="restoration-budget-track">
+          <div className="restoration-budget-used" style={{ width: `${(budget.effortUsed / budget.capacity) * 100}%` }} />
+        </div>
+        <div className="restoration-budget-meta">
+          <span>已投入 {budget.effortUsed} 点</span>
+          <span>下一措施效率约 {Math.round(budget.nextEfficiency * 100)}%</span>
+        </div>
+        {budget.projects.length > 0 && (
+          <ul className="restoration-project-list">
+            {budget.projects.map((project) => (
+              <li key={project.sequence}>
+                <span>{project.label} · {project.targetSpeciesName}</span>
+                <small>第 {project.day} 日 · {project.effort} 点 · 效率 {Math.round(project.efficiency * 100)}%</small>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <label>
+        <span>修复方式（占用资源 / 作用范围）</span>
+        <select value={action} onChange={(event) => onActionChange(event.target.value as RestorationAction)}>
+          {RESTORATION_ACTIONS.map((value) => (
+            <option key={value} value={value} disabled={value === 'restore_wetland' && site.id !== 'stream_valley'}>
+              {RESTORATION_LABELS[value]}（{RESTORATION_EFFORT[value]} 点{value === 'protect_seed_bank' ? ' · 仅目标物种' : ' · 区域协同'}）
+            </option>
+          ))}
+        </select>
+      </label>
+      <p className="restoration-description">{RESTORATION_DESCRIPTIONS[action]}</p>
+      {denyReason && <p className="restoration-deny">{denyReason}</p>}
+      <button className="button button-secondary" type="button" disabled={disabled} onClick={() => onExecute(action)}>
+        执行修复（2 行动点）
+      </button>
+    </section>
+  );
 }

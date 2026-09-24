@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsup src/index.ts --format esm --platform node --sourcemap --clean --out-dir dist --external node:sqlite && node scripts/fix-node-sqlite.mjs",
+    "build": "tsup --config tsup.config.ts && node scripts/fix-node-sqlite.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "db:init": "tsx src/scripts/init-db.ts",

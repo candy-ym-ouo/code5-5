@@ -5,6 +5,7 @@ import { SCHEMA_SQL } from './schema.ts';
 
 export class Store {
   readonly db: DatabaseSync;
+  private inTransaction = false;
 
   constructor(databasePath: string) {
     if (databasePath !== ':memory:') {
@@ -23,13 +24,33 @@ export class Store {
   }
 
   transaction<T>(operation: () => T): T {
+    if (this.inTransaction) {
+      return this.nestedTransaction(operation);
+    }
     this.db.exec('BEGIN IMMEDIATE');
+    this.inTransaction = true;
     try {
       const result = operation();
       this.db.exec('COMMIT');
+      this.inTransaction = false;
       return result;
     } catch (error) {
       this.db.exec('ROLLBACK');
+      this.inTransaction = false;
+      throw error;
+    }
+  }
+
+  private nestedTransaction<T>(operation: () => T): T {
+    const name = `sp_${Math.random().toString(16).slice(2)}`;
+    this.db.exec(`SAVEPOINT ${name}`);
+    try {
+      const result = operation();
+      this.db.exec(`RELEASE SAVEPOINT ${name}`);
+      return result;
+    } catch (error) {
+      this.db.exec(`ROLLBACK TO SAVEPOINT ${name}`);
+      this.db.exec(`RELEASE SAVEPOINT ${name}`);
       throw error;
     }
   }

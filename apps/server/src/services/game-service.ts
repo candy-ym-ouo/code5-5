@@ -1,10 +1,13 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import type {
   AnnualReview,
+  CommandHistoryEntry,
   GameCommand,
   GamePhase,
   JournalEntry,
   RecentEvent,
+  ReplayResult,
+  RestorationAction,
   SampleMethod,
   Season,
   SeasonReview,
@@ -12,10 +15,12 @@ import type {
   SpeciesSnapshot,
   WorldSnapshot
 } from '@shanhai/contracts';
-import { SEASON_LABELS } from '@shanhai/contracts';
+import { RESTORATION_LABELS, SEASON_LABELS } from '@shanhai/contracts';
 import {
   applyOverwinter,
+  applyRestorationImmediate,
   applySampleEffects,
+  applySiteRestoration,
   CATALOG_VERSION,
   createSpeciesState,
   disperseSpecies,
@@ -27,14 +32,22 @@ import {
   getStatus,
   getSuitability,
   nextSeason,
+  planRestoration,
+  restorationEfficiency,
+  restorationRemaining,
+  RESTORATION_BLUEPRINTS,
+  RESTORATION_SEASON_CAPACITY,
+  RESTORATION_SITE_SCOPED,
   round,
+  settleRestorationSeason,
   SPECIES_BY_ID,
   SITES,
   SITES_BY_ID,
+  type RestorationProject,
   type SiteState,
   type SpeciesState
 } from '@shanhai/game-core';
-import type { Store } from '../db/store.ts';
+import { Store } from '../db/store.ts';
 import { config } from '../config.ts';
 import { AppError } from '../errors.ts';
 
@@ -123,12 +136,7 @@ const SAMPLE_LABELS: Record<SampleMethod, string> = {
   cutting: '标准剪取'
 };
 
-const RESTORATION_LABELS: Record<string, string> = {
-  reduce_disturbance: '降低区域干扰',
-  protect_seed_bank: '保留种子区',
-  restore_wetland: '恢复湿生带',
-  establish_plot: '设置长期观察样方'
-};
+const SITE_SCOPE_MARKER = '*';
 
 export class GameService {
   constructor(private readonly store: Store) {}
@@ -400,6 +408,26 @@ export class GameService {
           event.message,
           JSON.stringify(event.effects),
           JSON.stringify(outcome.event.payload),
+          event.createdAt
+        );
+
+      const logRow = this.store.db
+        .prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM command_log WHERE save_id = ?')
+        .get(saveId) as unknown as { sequence: number };
+      this.store.db
+        .prepare(
+          `INSERT INTO command_log
+           (sequence, save_id, revision, idempotency_key, command_json, event_type, event_message, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          Number(logRow.sequence),
+          saveId,
+          save.revision,
+          request.idempotencyKey,
+          JSON.stringify(request.command),
+          outcome.event.type,
+          outcome.event.message,
           event.createdAt
         );
 
@@ -750,7 +778,7 @@ export class GameService {
   private restoreHabitat(
     save: SaveRecord,
     speciesId: string,
-    action: Extract<GameCommand, { type: 'RESTORE_HABITAT' }>['action']
+    action: RestorationAction
   ): CommandOutcome {
     this.requireActive(save);
     if (!save.restoration_unlocked) {
@@ -762,35 +790,108 @@ export class GameService {
     if (!definition || !state || !site || state.population <= 1) {
       throw new AppError('SPECIES_NOT_VISIBLE', '当前区域没有可修复的目标物种', 409);
     }
-    if (action === 'restore_wetland' && save.current_site_id !== 'stream_valley') {
+    const siteId = save.current_site_id;
+    if (action === 'restore_wetland' && siteId !== 'stream_valley') {
       throw new AppError('ACTION_NOT_ALLOWED', '恢复湿生带只能在溪谷湿地执行', 409);
+    }
+
+    // 同区域同季节的项目争夺有限季节资源：先检查重复性与容量（全部发生在写入之前，
+    // 任何失败都由事务整体回滚，不留下半截修复）。
+    const projects = this.getRestorationProjects(save.id, save.year, save.season, siteId);
+    const blueprint = RESTORATION_BLUEPRINTS[action];
+    const scopeSpeciesId = RESTORATION_SITE_SCOPED.has(action) ? SITE_SCOPE_MARKER : speciesId;
+    if (projects.some((project) => project.action === action && project.scopeSpeciesId === scopeSpeciesId)) {
+      throw new AppError(
+        'RESTORATION_ALREADY_PLANNED',
+        `本季已在该区域执行过${blueprint.label}，重复修复不会叠加收益`,
+        409,
+        { action, siteId, scopeSpeciesId },
+        false
+      );
+    }
+    const remaining = restorationRemaining(projects);
+    if (remaining < blueprint.effort) {
+      throw new AppError(
+        'RESTORATION_CAPACITY_EXHAUSTED',
+        `本季 ${SITES_BY_ID.get(siteId)?.name ?? siteId} 的修复资源仅剩 ${remaining} 点，${blueprint.label}需要 ${blueprint.effort} 点`,
+        409,
+        { remaining, required: blueprint.effort, capacity: RESTORATION_SEASON_CAPACITY },
+        true
+      );
     }
     if (save.action_points < 2) {
       throw new AppError('NO_ACTION_POINTS', '生态修复需要 2 个行动点', 409);
     }
 
-    const profile = definition.zones[save.current_site_id]!;
-    if (action === 'reduce_disturbance' || action === 'restore_wetland') {
-      site.disturbance = Math.max(0, site.disturbance - (action === 'restore_wetland' ? 0.1 : 0.07));
-      state.health = Math.min(100, state.health + 3);
+    const profile = definition.zones[siteId]!;
+    const effortUsed = RESTORATION_SEASON_CAPACITY - remaining;
+    const effects = planRestoration(action, profile.carryingCapacity, effortUsed);
+
+    const nextSite = applySiteRestoration(site, effects);
+    const nextState = applyRestorationImmediate(state, effects, profile.carryingCapacity);
+    this.upsertSiteState(nextSite);
+    this.upsertSpeciesState(nextState);
+
+    const sequenceRow = this.store.db
+      .prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM restoration_projects WHERE save_id = ?')
+      .get(save.id) as unknown as { sequence: number };
+    const project: RestorationProject = {
+      saveId: save.id,
+      year: save.year,
+      season: save.season,
+      siteId,
+      sequence: Number(sequenceRow.sequence),
+      action,
+      scopeSpeciesId: scopeSpeciesId as '*' | string,
+      targetSpeciesId: speciesId,
+      effort: blueprint.effort,
+      efficiency: effects.efficiency,
+      day: save.day
+    };
+    try {
+      this.insertRestorationProject(project);
+    } catch (error) {
+      // 并发下另一个请求可能已经提交相同范围的项目：UNIQUE 约束兜底，事务回滚。
+      if (isUniqueConstraintError(error)) {
+        throw new AppError(
+          'RESTORATION_ALREADY_PLANNED',
+          `本季已在该区域执行过${blueprint.label}，并发修复不会叠加收益`,
+          409,
+          { action, siteId, scopeSpeciesId },
+          true
+        );
+      }
+      throw error;
     }
-    if (action === 'protect_seed_bank') {
-      state.seedBank = Math.min(profile.carryingCapacity * 1.8, state.seedBank + profile.carryingCapacity * 0.1);
-    }
-    if (action === 'establish_plot') {
-      state.health = Math.min(100, state.health + 2);
-      state.seedBank = Math.min(profile.carryingCapacity * 1.8, state.seedBank + profile.carryingCapacity * 0.04);
-    }
-    state.status = getStatus(state.population, profile.carryingCapacity, state.health);
-    this.upsertSiteState(site);
-    this.upsertSpeciesState(state);
+
     this.consumeAction(save, 2);
     return {
       event: {
         type: 'RESTORE_HABITAT',
-        message: `${RESTORATION_LABELS[action]}：${definition.name}`,
-        effects: ['区域干扰下降或繁殖条件改善', '修复效果会在后续季节或年度显现', '消耗 2 个行动点'],
-        payload: { speciesId, action, siteId: save.current_site_id }
+        message: `${blueprint.label}：${definition.name}`,
+        effects: [
+          `投入修复资源 ${blueprint.effort}/${RESTORATION_SEASON_CAPACITY}，季节竞争效率 ${Math.round(effects.efficiency * 100)}%`,
+          effects.disturbanceDelta < 0
+            ? `区域干扰 ${formatSigned(round(effects.disturbanceDelta, 4))}`
+            : '区域环境条件保持稳定',
+          effects.healthDelta > 0 ? `${definition.name} 健康度 +${round(effects.healthDelta, 1)}` : '目标物种健康度保持稳定',
+          effects.seedBankDelta > 0 ? `${definition.name} 种子库 +${round(effects.seedBankDelta, 1)}` : '目标物种种子库保持稳定',
+          blueprint.spillover ? '区域协同效果将在季末结算时惠及同区域物种' : '收益仅作用于目标物种',
+          '消耗 2 个行动点'
+        ],
+        payload: {
+          speciesId,
+          action,
+          siteId,
+          effort: blueprint.effort,
+          efficiency: effects.efficiency,
+          effects: {
+            disturbanceDelta: round(effects.disturbanceDelta, 4),
+            healthDelta: round(effects.healthDelta, 2),
+            seedBankDelta: round(effects.seedBankDelta, 2),
+            recruitmentDelta: round(effects.recruitmentDelta, 2)
+          }
+        }
       }
     };
   }
@@ -919,11 +1020,33 @@ export class GameService {
   }
 
   private closeSeason(save: SaveRecord): SeasonReview {
-    const speciesStates = this.getSpeciesStates(save.id, save.year);
+    let speciesStates = this.getSpeciesStates(save.id, save.year);
     const siteStates = this.getSiteStates(save.id, save.year);
     const siteMap = new Map(siteStates.map((site) => [site.siteId, site]));
     const before = new Map(speciesStates.map((state) => [stateKey(state), state]));
     const finalStates: SpeciesState[] = [];
+
+    // 季末结算：本季修复项目先把区域/物种延续效果作用到种群，
+    // 再进入统一的季节演化，使修复收益与气候压力在同一公式中竞争。
+    const projects = this.getRestorationProjects(save.id, save.year, save.season);
+    const restoredStates = settleRestorationSeason(projects, speciesStates, (siteId, speciesId) => {
+      const profile = SPECIES_BY_ID.get(speciesId)?.zones[siteId];
+      return profile?.carryingCapacity;
+    });
+    for (const restored of restoredStates) {
+      const previous = speciesStates.find(
+        (state) => state.siteId === restored.siteId && state.speciesId === restored.speciesId
+      );
+      if (previous && (
+        previous.health !== restored.health ||
+        previous.population !== restored.population ||
+        previous.seedBank !== restored.seedBank ||
+        previous.status !== restored.status
+      )) {
+        this.upsertSpeciesState(restored);
+      }
+    }
+    speciesStates = restoredStates;
 
     const environmentHistory = this.getEnvironmentHistory(save.id, save.year, save.season);
     for (const state of speciesStates) {
@@ -1102,6 +1225,8 @@ export class GameService {
           ? '生态系统总体稳定，但局部种群正在调整'
           : '适宜生境中的种群实现增长，分布正在恢复';
 
+    const restorationProjects = this.aggregateRestorationProjects(save.id, save.year);
+
     return {
       year: save.year,
       headline,
@@ -1110,8 +1235,48 @@ export class GameService {
       distributionChanges: distributionChanges.length > 0 ? distributionChanges : ['本年度未发生跨等级分布状态变化。'],
       incorrectSamples,
       recommendations,
-      restorationUnlocked: false
+      restorationUnlocked: false,
+      restorationProjects
     };
+  }
+
+  private aggregateRestorationProjects(
+    saveId: string,
+    year: number
+  ): AnnualReview['restorationProjects'] {
+    const projects = this.getRestorationProjects(saveId, year);
+    const groups = new Map<
+      string,
+      {
+        siteId: SiteId;
+        action: RestorationAction;
+        targetSpeciesId: string;
+        count: number;
+        effort: number;
+      }
+    >();
+    for (const project of projects) {
+      const key = `${project.siteId}:${project.action}:${project.targetSpeciesId}`;
+      const group = groups.get(key) ?? {
+        siteId: project.siteId,
+        action: project.action,
+        targetSpeciesId: project.targetSpeciesId,
+        count: 0,
+        effort: 0
+      };
+      group.count += 1;
+      group.effort += project.effort;
+      groups.set(key, group);
+    }
+    return [...groups.values()].map((group) => ({
+      siteId: group.siteId,
+      siteName: SITES_BY_ID.get(group.siteId)?.name ?? group.siteId,
+      action: group.action,
+      label: RESTORATION_LABELS[group.action],
+      targetSpeciesName: SPECIES_BY_ID.get(group.targetSpeciesId)?.name ?? group.targetSpeciesId,
+      count: group.count,
+      effort: group.effort
+    }));
   }
 
   private buildWorld(save: SaveRecord): WorldSnapshot {
@@ -1145,6 +1310,13 @@ export class GameService {
       .all(save.id) as unknown as Array<{ species_id: string; count: number }>;
     const unlocked = new Set(unlockCounts.filter((row) => Number(row.count) >= 3).map((row) => row.species_id));
 
+    const restorationBySite = new Map<SiteId, RestorationProject[]>();
+    for (const project of this.getRestorationProjects(save.id, save.year, save.season)) {
+      const list = restorationBySite.get(project.siteId) ?? [];
+      list.push(project);
+      restorationBySite.set(project.siteId, list);
+    }
+
     const sites = SITES.map((site) => {
       const environment = siteMap.get(site.id) ?? generateSiteState(save.id, save.seed, save.year, save.season, save.day, site.id);
       const states = (speciesBySite.get(site.id) ?? [])
@@ -1171,6 +1343,7 @@ export class GameService {
           windSpeed: environment.windSpeed,
           disturbance: environment.disturbance
         },
+        restoration: this.toRestorationSnapshot(site.id, restorationBySite.get(site.id) ?? []),
         species: states
       };
     });
@@ -1473,6 +1646,283 @@ export class GameService {
       ).count
     );
   }
+
+  private getRestorationProjects(saveId: string, year: number, season?: Season, siteId?: SiteId): RestorationProject[] {
+    let sql = 'SELECT * FROM restoration_projects WHERE save_id = ? AND year = ?';
+    const params: Array<string | number> = [saveId, year];
+    if (season) {
+      sql += ' AND season = ?';
+      params.push(season);
+    }
+    if (siteId) {
+      sql += ' AND site_id = ?';
+      params.push(siteId);
+    }
+    sql += ' ORDER BY sequence ASC';
+    const rows = this.store.db.prepare(sql).all(...params) as unknown as Array<{
+      save_id: string;
+      year: number;
+      season: Season;
+      site_id: SiteId;
+      sequence: number;
+      action: RestorationAction;
+      scope_species_id: string;
+      target_species_id: string;
+      effort: number;
+      efficiency: number;
+      day: number;
+      created_at: string;
+    }>;
+    return rows.map((row) => ({
+      saveId: row.save_id,
+      year: Number(row.year),
+      season: row.season,
+      siteId: row.site_id,
+      sequence: Number(row.sequence),
+      action: row.action,
+      scopeSpeciesId: row.scope_species_id,
+      targetSpeciesId: row.target_species_id,
+      effort: Number(row.effort),
+      efficiency: Number(row.efficiency),
+      day: Number(row.day),
+      createdAt: row.created_at
+    }));
+  }
+
+  private insertRestorationProject(project: RestorationProject): void {
+    this.store.db
+      .prepare(
+        `INSERT INTO restoration_projects
+         (id, save_id, year, season, site_id, sequence, action, scope_species_id,
+          target_species_id, effort, efficiency, day, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        randomUUID(),
+        project.saveId,
+        project.year,
+        project.season,
+        project.siteId,
+        project.sequence,
+        project.action,
+        project.scopeSpeciesId,
+        project.targetSpeciesId,
+        project.effort,
+        project.efficiency,
+        project.day,
+        new Date().toISOString()
+      );
+  }
+
+  private toRestorationSnapshot(siteId: SiteId, projects: RestorationProject[]): WorldSnapshot['sites'][number]['restoration'] {
+    const effortUsed = projects.reduce((sum, project) => sum + project.effort, 0);
+    const remaining = RESTORATION_SEASON_CAPACITY - effortUsed;
+    return {
+      capacity: RESTORATION_SEASON_CAPACITY,
+      effortUsed,
+      remaining,
+      nextEfficiency: restorationEfficiency(effortUsed),
+      projects: projects.map((project) => ({
+        sequence: project.sequence,
+        action: project.action,
+        label: RESTORATION_LABELS[project.action],
+        targetSpeciesId: project.targetSpeciesId,
+        targetSpeciesName: SPECIES_BY_ID.get(project.targetSpeciesId)?.name ?? project.targetSpeciesId,
+        effort: project.effort,
+        efficiency: project.efficiency,
+        day: project.day,
+        createdAt: project.createdAt ?? ''
+      }))
+    };
+  }
+
+  getCommandHistory(sessionId: string, saveId: string): CommandHistoryEntry[] {
+    this.getSaveOrThrow(saveId, sessionId);
+    const rows = this.store.db
+      .prepare('SELECT * FROM command_log WHERE save_id = ? ORDER BY sequence ASC')
+      .all(saveId) as unknown as Array<{
+        sequence: number;
+        revision: number;
+        command_json: string;
+        idempotency_key: string;
+        event_type: string;
+        event_message: string;
+        created_at: string;
+      }>;
+    return rows.map((row) => ({
+      sequence: Number(row.sequence),
+      revision: Number(row.revision),
+      command: parseJson<GameCommand>(row.command_json, {} as GameCommand),
+      idempotencyKey: row.idempotency_key,
+      eventType: row.event_type,
+      eventMessage: row.event_message,
+      createdAt: row.created_at
+    }));
+  }
+
+  /**
+   * 历史操作可重放：在独立内存库中以相同种子重建开局，再按 command_log 顺序重放全部命令，
+   * 逐表比对重放结果与当前权威状态。游戏模拟全部基于确定性种子，无随机副作用，
+   * 因此差异只能来自日志缺失/损坏或逻辑回归。
+   */
+  replayFromHistory(sessionId: string, saveId: string): ReplayResult {
+    const source = this.getSaveOrThrow(saveId, sessionId);
+    const commands = this.getCommandHistory(sessionId, saveId);
+
+    const replayStore = new Store(':memory:');
+    try {
+      return replayStore.transaction(() => {
+        replayStore.db
+          .prepare('INSERT INTO sessions (id, token_hash, created_at, last_seen_at) VALUES (?, ?, ?, ?)')
+          .run(sessionId, 'replay', new Date().toISOString(), new Date().toISOString());
+        const now = new Date().toISOString();
+        replayStore.db
+          .prepare(
+            `INSERT INTO saves (
+              id, session_id, seed, revision, year, season, day, slot, action_points, phase,
+              current_site_id, year_start_species_json, year_start_sites_json,
+              restoration_unlocked, created_at, updated_at
+            ) VALUES (?, ?, ?, 0, 1, 'spring', 1, 1, 30, 'active', 'foothill', '[]', '[]', 0, ?, ?)`
+          )
+          .run(saveId, sessionId, source.seed, now, now);
+
+        const replayService = new GameService(replayStore);
+        const replaySave = replayStore.db
+          .prepare('SELECT * FROM saves WHERE id = ?')
+          .get(saveId) as unknown as SaveRecord;
+        replayService.initializeYear(replaySave);
+        replayService.updateSave(replaySave);
+
+        let expectedRevision = 0;
+        for (const entry of commands) {
+          replayService.executeCommand(sessionId, saveId, {
+            expectedRevision,
+            idempotencyKey: entry.idempotencyKey,
+            command: entry.command
+          });
+          expectedRevision += 1;
+        }
+
+        const actual = replayStore.db
+          .prepare('SELECT * FROM saves WHERE id = ?')
+          .get(saveId) as unknown as SaveRecord;
+        const revisionMatch = actual.revision === source.revision;
+        const yearMatch = actual.year === source.year;
+        const seasonMatch = actual.season === source.season;
+
+        let stateMatch = true;
+        let firstDifference: ReplayResult['firstDifference'] = null;
+        for (const table of ['site_states', 'species_states', 'restoration_projects'] as const) {
+          const difference = this.diffReplayTable(saveId, table, replayStore);
+          if (difference) {
+            stateMatch = false;
+            firstDifference ??= difference;
+          }
+        }
+        if (!revisionMatch) {
+          stateMatch = false;
+          firstDifference ??= {
+            table: 'saves.revision',
+            expected: source.revision,
+            actual: actual.revision
+          };
+        }
+
+        return {
+          saveId,
+          commandsReplayed: commands.length,
+          revisionMatch,
+          yearMatch,
+          seasonMatch,
+          stateMatch,
+          match: revisionMatch && yearMatch && seasonMatch && stateMatch,
+          firstDifference
+        };
+      });
+    } finally {
+      replayStore.close();
+    }
+  }
+
+  private diffReplayTable(
+    saveId: string,
+    table: 'site_states' | 'species_states' | 'restoration_projects',
+    replayStore: Store
+  ): ReplayResult['firstDifference'] {
+    const columnsByTable = {
+      site_states: [
+        'year',
+        'site_id',
+        'weather',
+        'temperature_c',
+        'humidity',
+        'soil_moisture',
+        'light_lux',
+        'wind_speed',
+        'disturbance'
+      ],
+      species_states: [
+        'year',
+        'site_id',
+        'species_id',
+        'population',
+        'health',
+        'seed_bank',
+        'suitability',
+        'status',
+        'phenology_json'
+      ],
+      restoration_projects: [
+        'year',
+        'season',
+        'site_id',
+        'action',
+        'scope_species_id',
+        'target_species_id',
+        'effort',
+        'efficiency',
+        'day'
+      ]
+    } as const;
+    const columns = columnsByTable[table];
+    const orderClause = table === 'restoration_projects' ? 'sequence ASC' : `${columns[0]} ASC, ${columns[1]} ASC, ${columns[2]} ASC`;
+    const sql = `SELECT ${columns.join(', ')} FROM ${table} WHERE save_id = ? ORDER BY ${orderClause}`;
+    const expectedRows = this.store.db.prepare(sql).all(saveId) as unknown as Array<Record<string, unknown>>;
+    const actualRows = replayStore.db.prepare(sql).all(saveId) as unknown as Array<Record<string, unknown>>;
+
+    const normalize = (rows: Array<Record<string, unknown>>) =>
+      rows.map((row) => this.normalizeReplayRow(table, row));
+    const expected = normalize(expectedRows);
+    const actual = normalize(actualRows);
+
+    if (JSON.stringify(expected) === JSON.stringify(actual)) {
+      return null;
+    }
+    const index = expected.findIndex((row, cursor) => JSON.stringify(row) !== JSON.stringify(actual[cursor]));
+    return {
+      table,
+      expected: expected[index >= 0 ? index : expected.length] ?? null,
+      actual: actual[index >= 0 ? index : actual.length] ?? null
+    };
+  }
+
+  private normalizeReplayRow(
+    table: 'site_states' | 'species_states' | 'restoration_projects',
+    row: Record<string, unknown>
+  ): Record<string, unknown> {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      if (typeof value === 'number' && !Number.isInteger(value)) {
+        normalized[key] = round(value, 4);
+      } else {
+        normalized[key] = value;
+      }
+    }
+    if (table === 'species_states' && typeof normalized.phenology_json === 'string') {
+      normalized.phenology_json = JSON.parse(String(normalized.phenology_json)) as unknown;
+    }
+    return normalized;
+  }
 }
 
 function rowToSiteState(row: SiteStateRow): SiteState {
@@ -1546,6 +1996,17 @@ function parseJson<T>(value: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  const candidate = error as { code?: string; message?: string };
+  if (candidate.code === 'SQLITE_CONSTRAINT_UNIQUE' || candidate.code === 'ERR_SQLITE_CONSTRAINT_UNIQUE') {
+    return true;
+  }
+  return typeof candidate.message === 'string' && /UNIQUE constraint failed/i.test(candidate.message);
 }
 
 export function hashToken(token: string): string {
