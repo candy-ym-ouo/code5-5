@@ -9,10 +9,19 @@ import { z, ZodError } from 'zod';
 import {
   CommandRequestSchema,
   ImportSaveSchema,
+  RESTORATION_ACTIONS,
+  SEASONAL_RESTORATION_BUDGET,
   SITE_IDS,
   SEASONS
 } from '@shanhai/contracts';
-import { CATALOG_VERSION, SPECIES, SITES } from '@shanhai/game-core';
+import {
+  CATALOG_VERSION,
+  getRestorationCost,
+  RESTORATION_ACTION_DESCRIPTIONS,
+  RESTORATION_ACTION_LABELS,
+  SPECIES,
+  SITES
+} from '@shanhai/game-core';
 import { config } from './config.ts';
 import { Store } from './db/store.ts';
 import { AppError } from './errors.ts';
@@ -100,7 +109,21 @@ export function createApp(options: CreateAppOptions = {}) {
         lifeForm: species.lifeForm,
         description: species.description,
         protected: species.protected
-      }))
+      })),
+      restoration: {
+        seasonalBudget: SEASONAL_RESTORATION_BUDGET,
+        actions: RESTORATION_ACTIONS.map((action) => ({
+          id: action,
+          label: RESTORATION_ACTION_LABELS[action],
+          description: RESTORATION_ACTION_DESCRIPTIONS[action],
+          seasonalCosts: {
+            spring: getRestorationCost(action, 'spring'),
+            summer: getRestorationCost(action, 'summer'),
+            autumn: getRestorationCost(action, 'autumn'),
+            winter: getRestorationCost(action, 'winter')
+          }
+        }))
+      }
     });
   });
 
@@ -160,6 +183,10 @@ export function createApp(options: CreateAppOptions = {}) {
   app.get('/api/save/:saveId/events', requireSession, (req, res) => {
     const world = service.getWorld(res.locals.sessionId as string, parameter(req, 'saveId'));
     res.json({ events: world.recentEvents });
+  });
+
+  app.post('/api/save/:saveId/replay', requireSession, (req, res) => {
+    res.json(service.replayHistory(res.locals.sessionId as string, parameter(req, 'saveId')));
   });
 
   app.post('/api/save/:saveId/commands', requireSession, (req, res) => {

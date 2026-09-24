@@ -82,9 +82,64 @@ try {
   assert.equal(world.season, 'spring');
   assert.equal(world.phase, 'active');
 
+  // 升级后的生态修复：不同措施争夺同一季 6 点资源；同区同措施不可重复加成；失败整体回滚。
+  assert.ok(world.restorationUnlocked);
+  assert.equal(world.restorationBudget.total, 6);
+  assert.equal(world.restorationBudget.remaining, 6);
+
+  await send({ type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'reduce_disturbance' });
+  assert.equal(world.restorationBudget.spent, 1);
+  const foothillAfterFirst = world.sites.find((site) => site.id === 'foothill');
+  assert.equal(foothillAfterFirst.restorations.length, 1);
+
+  // 并发式重复提交同区同措施：第二次必须被拒绝，资源与 revision 不得变化。
+  const blockedRevision = world.revision;
+  const duplicateResponse = await fetch(`${baseUrl}/api/save/${world.saveId}/commands`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({
+      expectedRevision: world.revision,
+      idempotencyKey: crypto.randomUUID(),
+      command: { type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'reduce_disturbance' }
+    })
+  });
+  assert.equal(duplicateResponse.status, 409);
+  const duplicateBody = await duplicateResponse.json();
+  assert.equal(duplicateBody.code, 'RESTORATION_NOT_AVAILABLE');
+  world = await api(`/api/save/${world.saveId}/world`);
+  assert.equal(world.revision, blockedRevision);
+  assert.equal(world.restorationBudget.spent, 1);
+
+  // 种子区 + 样方共占用 3.4，剩余 1.2；溪谷湿生带需要 3.3，竞争失败必须回滚。
+  await send({ type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'protect_seed_bank' });
+  await send({ type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'establish_plot' });
+  assert.ok(Math.abs(world.restorationBudget.remaining - 1.2) < 1e-6);
+  await send({ type: 'MOVE_ZONE', siteId: 'stream_valley' });
+  const failedRevision = world.revision;
+  const failedResponse = await fetch(`${baseUrl}/api/save/${world.saveId}/commands`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({
+      expectedRevision: world.revision,
+      idempotencyKey: crypto.randomUUID(),
+      command: { type: 'RESTORE_HABITAT', speciesId: 'acorus-calamus', action: 'restore_wetland' }
+    })
+  });
+  assert.equal(failedResponse.status, 409);
+  world = await api(`/api/save/${world.saveId}/world`);
+  assert.equal(world.revision, failedRevision);
+  assert.ok(Math.abs(world.restorationBudget.remaining - 1.2) < 1e-6);
+
+  // 历史操作必须可在隔离环境中完整重放，并与逐版本检查点完全一致。
+  const replay = await api(`/api/save/${world.saveId}/replay`, { method: 'POST' });
+  assert.equal(replay.matches, true);
+  assert.equal(replay.mismatchCount, 0);
+  assert.ok(replay.replayedCommands >= 10);
+  assert.equal(replay.finalRevision, world.revision);
+
   const report = await api(`/api/save/${world.saveId}/report/1`);
   assert.equal(report.year, 1);
-  console.log('Closed-loop E2E passed: create -> observe -> wrong sample -> four seasons -> report -> year 2');
+  console.log('Closed-loop E2E passed: create -> observe -> wrong sample -> four seasons -> report -> year 2 -> restoration competition -> rollback -> replay');
 
   async function waitForServer() {
     const deadline = Date.now() + 15_000;

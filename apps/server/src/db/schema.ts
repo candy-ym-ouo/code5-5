@@ -146,12 +146,42 @@ CREATE TABLE IF NOT EXISTS game_events (
   message TEXT NOT NULL,
   effects_json TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  command_json TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(save_id, sequence)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_save_sequence
   ON game_events(save_id, sequence DESC);
+
+-- 每个季节每个区域每种修复措施最多一条：并发/重复提交不能重复加成。
+-- resources_spent 记录该措施在当季共享预算中实际占用的资源。
+CREATE TABLE IF NOT EXISTS restoration_efforts (
+  id TEXT PRIMARY KEY,
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  season TEXT NOT NULL,
+  site_id TEXT NOT NULL,
+  species_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  resources_spent REAL NOT NULL,
+  day INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(save_id, year, season, site_id, action)
+);
+
+CREATE INDEX IF NOT EXISTS idx_restoration_efforts_season
+  ON restoration_efforts(save_id, year, season);
+
+-- 每次命令提交后的权威状态检查点，用于失败回滚后的核对与历史重放比对。
+CREATE TABLE IF NOT EXISTS state_checkpoints (
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  sites_json TEXT NOT NULL,
+  species_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (save_id, revision)
+);
 
 CREATE TABLE IF NOT EXISTS command_receipts (
   save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,

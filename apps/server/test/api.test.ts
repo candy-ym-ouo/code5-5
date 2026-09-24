@@ -125,6 +125,13 @@ describe('closed-loop API', () => {
     const report = await agent.get(`/api/save/${world.saveId}/report/1`).expect(200);
     expect(report.body.year).toBe(1);
 
+    // 历史操作可重放：从 revision 0 检查点在隔离内存库中重算并逐版本比对，结果应完全一致。
+    const replay = await agent.post(`/api/save/${world.saveId}/replay`).expect(200);
+    expect(replay.body.matches).toBe(true);
+    expect(replay.body.mismatchCount).toBe(0);
+    expect(replay.body.replayedCommands).toBeGreaterThan(10);
+    expect(replay.body.finalRevision).toBe(world.revision);
+
     const firstExport = await agent.post(`/api/save/${world.saveId}/export`).expect(200);
     expect(firstExport.body.token).toHaveLength(43);
     const latestExport = await agent.post(`/api/save/${world.saveId}/export`).expect(200);
@@ -171,3 +178,125 @@ async function advanceToDayEight(
   }
   return world;
 }
+
+describe('restoration resource competition', () => {
+  let app: ReturnType<typeof createApp>['app'];
+  let store: ReturnType<typeof createApp>['store'];
+  let agent: ReturnType<typeof request.agent>;
+
+  beforeAll(() => {
+    const created = createApp({ databasePath: ':memory:', loggerEnabled: false });
+    app = created.app;
+    store = created.store;
+    agent = request.agent(app);
+  });
+
+  afterAll(() => store.close());
+
+  function effortCount(saveId: string): number {
+    return Number(
+      (
+        store.db.prepare('SELECT COUNT(*) AS count FROM restoration_efforts WHERE save_id = ?').get(saveId) as unknown as {
+          count: number;
+        }
+      ).count
+    );
+  }
+
+  async function rawCommand(world: WorldSnapshot, commandBody: GameCommand, key = `raw-${Math.random().toString(16).slice(2)}`) {
+    return agent
+      .post(`/api/save/${world.saveId}/commands`)
+      .send({ expectedRevision: world.revision, idempotencyKey: key, command: commandBody });
+  }
+
+  it('shares one seasonal budget, refuses duplicate bonuses and rolls back failed attempts', async () => {
+    let world = (await agent.post('/api/save').expect(201)).body as WorldSnapshot;
+    store.db.prepare('UPDATE saves SET restoration_unlocked = 1 WHERE id = ?').run(world.saveId);
+    world = (await agent.get(`/api/save/${world.saveId}/world`).expect(200)).body as WorldSnapshot;
+
+    expect(world.restorationBudget).toEqual({ total: 6, spent: 0, remaining: 6 });
+
+    const beforeFoothill = world.sites.find((site) => site.id === 'foothill')!;
+    const beforeTarget = beforeFoothill.species.find((species) => species.id === 'prunus-davidiana')!;
+    const beforeNeighbor = beforeFoothill.species.find((species) => species.id === 'rhododendron-simsii')!;
+
+    // 第一次降低干扰：区域干扰下降，目标与同区物种都获得健康收益。
+    world = await command(agent, world, {
+      type: 'RESTORE_HABITAT',
+      speciesId: 'prunus-davidiana',
+      action: 'reduce_disturbance'
+    });
+    let foothill = world.sites.find((site) => site.id === 'foothill')!;
+    expect(foothill.environment.disturbance).toBeLessThan(beforeFoothill.environment.disturbance);
+    expect(foothill.restorations).toHaveLength(1);
+    expect(foothill.restorations[0]?.action).toBe('reduce_disturbance');
+    expect(
+      foothill.species.find((species) => species.id === 'prunus-davidiana')!.health
+    ).toBeGreaterThan(beforeTarget.health);
+    expect(
+      foothill.species.find((species) => species.id === 'rhododendron-simsii')!.health
+    ).toBeGreaterThan(beforeNeighbor.health);
+    expect(world.restorationBudget.spent).toBeCloseTo(1, 5);
+    expect(effortCount(world.saveId)).toBe(1);
+    const revisionAfterFirst = world.revision;
+
+    // 同区同措施再次执行：拒绝且不扣资源、不加 revision（不可重复加成）。
+    const duplicate = await rawCommand(world, {
+      type: 'RESTORE_HABITAT',
+      speciesId: 'prunus-davidiana',
+      action: 'reduce_disturbance'
+    });
+    expect(duplicate.status).toBe(409);
+    expect(duplicate.body.code).toBe('RESTORATION_NOT_AVAILABLE');
+    world = (await agent.get(`/api/save/${world.saveId}/world`).expect(200)).body as WorldSnapshot;
+    expect(world.revision).toBe(revisionAfterFirst);
+    expect(world.restorationBudget.spent).toBeCloseTo(1, 5);
+    expect(effortCount(world.saveId)).toBe(1);
+
+    // 同一幂等键重放同一请求：返回首个结果，绝不二次加成。
+    const idempotent = await rawCommand(
+      world,
+      { type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'protect_seed_bank' },
+      'restoration-idempotency-key'
+    );
+    expect(idempotent.status).toBe(200);
+    world = idempotent.body.world as WorldSnapshot;
+    const duplicateKey = await rawCommand(
+      world,
+      { type: 'RESTORE_HABITAT', speciesId: 'prunus-davidiana', action: 'protect_seed_bank' },
+      'restoration-idempotency-key'
+    );
+    expect(duplicateKey.body.event.id).toBe(idempotent.body.event.id);
+    expect(duplicateKey.body.world.revision).toBe(idempotent.body.world.revision);
+    expect(effortCount(world.saveId)).toBe(2);
+
+    // 再布设样方后，春季剩余 1.2 资源；湿生带需要 3.3，竞争失败必须整体回滚。
+    world = await command(agent, world, {
+      type: 'RESTORE_HABITAT',
+      speciesId: 'prunus-davidiana',
+      action: 'establish_plot'
+    });
+    expect(world.restorationBudget.remaining).toBeCloseTo(1.2, 5);
+    world = await command(agent, world, { type: 'MOVE_ZONE', siteId: 'stream_valley' });
+    const revisionBeforeFailed = world.revision;
+    const failedWetland = await rawCommand(world, {
+      type: 'RESTORE_HABITAT',
+      speciesId: 'acorus-calamus',
+      action: 'restore_wetland'
+    });
+    expect(failedWetland.status).toBe(409);
+    expect(failedWetland.body.code).toBe('RESTORATION_NOT_AVAILABLE');
+    world = (await agent.get(`/api/save/${world.saveId}/world`).expect(200)).body as WorldSnapshot;
+    expect(world.revision).toBe(revisionBeforeFailed);
+    expect(world.restorationBudget.remaining).toBeCloseTo(1.2, 5);
+    expect(effortCount(world.saveId)).toBe(3);
+    const valley = world.sites.find((site) => site.id === 'stream_valley')!;
+    expect(valley.restorations).toHaveLength(0);
+
+    // 失败回滚后历史仍可完整重放且与检查点一致。
+    const replay = await agent.post(`/api/save/${world.saveId}/replay`).expect(200);
+    expect(replay.body.matches).toBe(true);
+    expect(replay.body.mismatchCount).toBe(0);
+    expect(replay.body.replayedCommands).toBe(world.revision);
+  }, 30_000);
+});

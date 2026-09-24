@@ -16,9 +16,15 @@ export class Store {
   }
 
   private migrate(): void {
-    const columns = this.db.prepare('PRAGMA table_info(samples)').all() as unknown as Array<{ name: string }>;
-    if (!columns.some((column) => column.name === 'slot')) {
-      this.db.exec('ALTER TABLE samples ADD COLUMN slot INTEGER NOT NULL DEFAULT 1');
+    this.addColumnIfMissing('samples', 'slot', 'INTEGER NOT NULL DEFAULT 1');
+    // 升级前已存在的事件没有命令快照，历史重放时按类型重建状态类命令。
+    this.addColumnIfMissing('game_events', 'command_json', 'TEXT');
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
+    if (!columns.some((item) => item.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
   }
 

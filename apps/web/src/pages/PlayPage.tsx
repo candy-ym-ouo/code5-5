@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
+  RESTORATION_ACTIONS,
   SEASON_LABELS,
   SLOT_LABELS,
   type GameCommand,
+  type RestorationAction,
   type SampleMethod,
   type SpeciesSnapshot
 } from '@shanhai/contracts';
@@ -19,6 +21,18 @@ const SAMPLE_LABELS: Record<SampleMethod, string> = {
   cutting: '标准剪取'
 };
 
+const RESTORATION_UI: Record<RestorationAction, { label: string; baseCost: Record<string, number>; hint: string }> = {
+  reduce_disturbance: { label: '降低区域干扰', baseCost: { spring: 1, summer: 1, autumn: 1, winter: 1 }, hint: '干扰下降，惠及同区物种' },
+  protect_seed_bank: { label: '保留种子区', baseCost: { spring: 0.7, summer: 0.9, autumn: 1.3, winter: 1 }, hint: '秋季最强但最耗资源' },
+  restore_wetland: { label: '恢复湿生带', baseCost: { spring: 1.1, summer: 1.3, autumn: 0.9, winter: 0.7 }, hint: '仅溪谷湿地，抬升土壤含水' },
+  establish_plot: { label: '设置长期观察样方', baseCost: { spring: 1.2, summer: 1, autumn: 0.9, winter: 0.8 }, hint: '小幅改善健康与种子库' }
+};
+
+function restorationCost(action: RestorationAction, season: string): number {
+  const base = RESTORATION_UI[action].baseCost[season] ?? 1;
+  return Math.round(base * 10) / 10;
+}
+
 const STATUS_LABELS: Record<SpeciesSnapshot['status'], string> = {
   growing: '增长',
   stable: '稳定',
@@ -31,7 +45,7 @@ export function PlayPage() {
   const { world, execute, pending } = useGame();
   const currentSite = world.sites.find((site) => site.current) ?? world.sites[0]!;
   const [selectedSpeciesId, setSelectedSpeciesId] = useState(currentSite.species[0]?.id ?? '');
-  const [restoreAction, setRestoreAction] = useState<'reduce_disturbance' | 'protect_seed_bank' | 'restore_wetland' | 'establish_plot'>('reduce_disturbance');
+  const [restoreAction, setRestoreAction] = useState<RestorationAction>('reduce_disturbance');
 
   useEffect(() => {
     if (!currentSite.species.some((species) => species.id === selectedSpeciesId)) {
@@ -44,6 +58,22 @@ export function PlayPage() {
       setRestoreAction('reduce_disturbance');
     }
   }, [currentSite.id, restoreAction]);
+
+  // 资源耗尽或本季已执行过的措施不可重复加成，自动跳到首个仍可执行的措施。
+  useEffect(() => {
+    const currentCost = restorationCost(restoreAction, world.season);
+    const blocked =
+      currentSite.restorations.some((item) => item.action === restoreAction) ||
+      (restoreAction === 'restore_wetland' && currentSite.id !== 'stream_valley') ||
+      world.restorationBudget.remaining + 1e-9 < currentCost;
+    if (!blocked) return;
+    const fallback = RESTORATION_ACTIONS.find((action) => {
+      if (currentSite.restorations.some((item) => item.action === action)) return false;
+      if (action === 'restore_wetland' && currentSite.id !== 'stream_valley') return false;
+      return world.restorationBudget.remaining + 1e-9 >= restorationCost(action, world.season);
+    });
+    if (fallback) setRestoreAction(fallback);
+  }, [currentSite, world.season, world.restorationBudget.remaining, restoreAction]);
 
   const selectedSpecies = useMemo(
     () => currentSite.species.find((species) => species.id === selectedSpeciesId) ?? currentSite.species[0] ?? null,
@@ -237,25 +267,72 @@ export function PlayPage() {
                 <div>
                   <p className="eyebrow">RESTORATION UNLOCKED</p>
                   <h2>把年报结论变成行动</h2>
-                  <p>修复行动消耗 2 个行动点，影响会在季末或下一年度显现。</p>
+                  <p>修复行动消耗 2 个行动点。四项措施争夺本季共享的修复资源，同区同措施每季只能生效一次。</p>
                 </div>
-                <label>
-                  <span>修复方式</span>
-                  <select value={restoreAction} onChange={(event) => setRestoreAction(event.target.value as typeof restoreAction)}>
-                    <option value="reduce_disturbance">降低区域干扰</option>
-                    <option value="protect_seed_bank">保留种子区</option>
-                    <option value="restore_wetland" disabled={currentSite.id !== 'stream_valley'}>恢复湿生带（仅溪谷）</option>
-                    <option value="establish_plot">设置长期观察样方</option>
-                  </select>
-                </label>
+                <div className="restoration-budget" aria-label="本季修复资源">
+                  <span>本季修复资源</span>
+                  <div className="budget-bar">
+                    <i style={{ width: `${Math.min(100, (world.restorationBudget.spent / world.restorationBudget.total) * 100)}%` }} />
+                  </div>
+                  <strong>
+                    {world.restorationBudget.remaining}/{world.restorationBudget.total} 可用
+                  </strong>
+                </div>
+                <div className="restoration-options">
+                  {RESTORATION_ACTIONS.map((action) => {
+                    const cost = restorationCost(action, world.season);
+                    const siteWide = currentSite.restorations.some((item) => item.action === action);
+                    const wetlandLocked = action === 'restore_wetland' && currentSite.id !== 'stream_valley';
+                    const affordable = world.restorationBudget.remaining + 1e-9 >= cost;
+                    const disabled = siteWide || wetlandLocked || !affordable || world.actionPoints < 2 || pending;
+                    const reason = wetlandLocked
+                      ? '仅溪谷湿地'
+                      : siteWide
+                        ? '本季已执行，不可叠加'
+                        : !affordable
+                          ? '季节资源不足'
+                          : undefined;
+                    return (
+                      <button
+                        key={action}
+                        type="button"
+                        className={`restoration-option ${restoreAction === action ? 'active' : ''} ${disabled && restoreAction !== action ? 'is-locked' : ''}`}
+                        disabled={disabled && restoreAction !== action}
+                        onClick={() => setRestoreAction(action)}
+                      >
+                        <strong>{RESTORATION_UI[action].label}</strong>
+                        <small>{RESTORATION_UI[action].hint}</small>
+                        <span className="restoration-cost">
+                          季节资源 {cost} · 目标 {currentSite.restorations.find((item) => item.action === action)?.speciesName ?? '—'}
+                        </span>
+                        {reason && <em className="restoration-lock">{reason}</em>}
+                      </button>
+                    );
+                  })}
+                </div>
                 <button
                   className="button button-secondary"
                   type="button"
-                  disabled={pending || world.actionPoints < 2}
+                  disabled={
+                    pending ||
+                    world.actionPoints < 2 ||
+                    currentSite.restorations.some((item) => item.action === restoreAction) ||
+                    (restoreAction === 'restore_wetland' && currentSite.id !== 'stream_valley') ||
+                    world.restorationBudget.remaining + 1e-9 < restorationCost(restoreAction, world.season)
+                  }
                   onClick={() => void run({ type: 'RESTORE_HABITAT', speciesId: selectedSpecies.id, action: restoreAction })}
                 >
-                  执行修复
+                  执行修复（{RESTORATION_UI[restoreAction].label}）
                 </button>
+                {currentSite.restorations.length > 0 && (
+                  <ul className="restoration-log">
+                    {currentSite.restorations.map((item) => (
+                      <li key={`${item.action}-${item.day}`}>
+                        第 {item.day} 日 · {item.label} · {item.speciesName} · 占用 {item.resourcesSpent}
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </section>
             )}
 

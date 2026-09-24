@@ -5,6 +5,8 @@ import type {
   CommandRequest,
   GameCommand,
   JournalEntry,
+  ReplayReport,
+  RestorationAction,
   Season,
   SiteId,
   SpeciesSnapshot,
@@ -102,6 +104,10 @@ export const api = {
     request<AnnualReview>(`/api/save/${saveId}/report/${year}`),
   exportSave: (saveId: string) =>
     request<{ token: string; expiresAt: string }>(`/api/save/${saveId}/export`, {
+      method: 'POST'
+    }),
+  replayHistory: (saveId: string) =>
+    request<ReplayReport>(`/api/save/${saveId}/replay`, {
       method: 'POST'
     }),
   importSave: (token: string) =>

@@ -28,6 +28,17 @@ export type LeafTexture = (typeof LEAF_TEXTURES)[number];
 export const SAMPLE_METHODS = ['photo', 'rubbing', 'litter', 'cutting'] as const;
 export type SampleMethod = (typeof SAMPLE_METHODS)[number];
 
+export const RESTORATION_ACTIONS = [
+  'reduce_disturbance',
+  'protect_seed_bank',
+  'restore_wetland',
+  'establish_plot'
+] as const;
+export type RestorationAction = (typeof RESTORATION_ACTIONS)[number];
+
+/** 每季共享的修复资源（工时/物资）总量，所有措施在同一预算池内竞争。 */
+export const SEASONAL_RESTORATION_BUDGET = 6;
+
 const ObservationValuesSchema = z.object({
   phenology: z.enum(PHENOLOGY_STAGES),
   leafTexture: z.enum(LEAF_TEXTURES),
@@ -56,7 +67,7 @@ export const CommandSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('RESTORE_HABITAT'),
     speciesId: z.string().min(1),
-    action: z.enum(['reduce_disturbance', 'protect_seed_bank', 'restore_wetland', 'establish_plot'])
+    action: z.enum(RESTORATION_ACTIONS)
   }),
   z.object({ type: z.literal('END_SEASON') }),
   z.object({ type: z.literal('BEGIN_NEXT_SEASON') }),
@@ -98,6 +109,24 @@ export interface CatalogMeta {
   version: string;
   sites: Array<z.infer<typeof PublicSiteSchema>>;
   species: Array<z.infer<typeof PublicSpeciesSchema>>;
+  restoration: {
+    seasonalBudget: number;
+    actions: Array<{
+      id: RestorationAction;
+      label: string;
+      description: string;
+      seasonalCosts: Record<Season, number>;
+    }>;
+  };
+}
+
+export interface ActiveRestoration {
+  action: RestorationAction;
+  label: string;
+  speciesId: string;
+  speciesName: string;
+  resourcesSpent: number;
+  day: number;
 }
 
 export interface SiteSnapshot {
@@ -118,6 +147,7 @@ export interface SiteSnapshot {
     disturbance: number;
   };
   species: SpeciesSnapshot[];
+  restorations: ActiveRestoration[];
 }
 
 export interface SpeciesSnapshot {
@@ -193,10 +223,41 @@ export interface WorldSnapshot {
   phase: GamePhase;
   currentSiteId: SiteId;
   restorationUnlocked: boolean;
+  restorationBudget: {
+    total: number;
+    spent: number;
+    remaining: number;
+  };
   sites: SiteSnapshot[];
   recentEvents: RecentEvent[];
   seasonReview: SeasonReview | null;
   annualReview: AnnualReview | null;
+}
+
+export interface CommandHistoryEntry {
+  sequence: number;
+  revision: number;
+  type: GameCommand['type'];
+  command: GameCommand;
+  siteId: SiteId | null;
+  createdAt: string;
+}
+
+export interface ReplayMismatch {
+  scope: 'save' | 'site' | 'species' | 'count';
+  key: string;
+  field?: string;
+  expected: unknown;
+  actual: unknown;
+}
+
+export interface ReplayReport {
+  replayedCommands: number;
+  finalRevision: number;
+  matches: boolean;
+  mismatchCount: number;
+  mismatches: ReplayMismatch[];
+  checkedAt: string;
 }
 
 export interface JournalEntry {

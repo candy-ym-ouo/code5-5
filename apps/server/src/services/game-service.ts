@@ -1,10 +1,14 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import type {
+  ActiveRestoration,
   AnnualReview,
   GameCommand,
   GamePhase,
   JournalEntry,
   RecentEvent,
+  ReplayMismatch,
+  ReplayReport,
+  RestorationAction,
   SampleMethod,
   Season,
   SeasonReview,
@@ -12,11 +16,13 @@ import type {
   SpeciesSnapshot,
   WorldSnapshot
 } from '@shanhai/contracts';
-import { SEASON_LABELS } from '@shanhai/contracts';
+import { SEASON_LABELS, SEASONAL_RESTORATION_BUDGET } from '@shanhai/contracts';
 import {
   applyOverwinter,
+  applyRestoration,
   applySampleEffects,
   CATALOG_VERSION,
+  clamp,
   createSpeciesState,
   disperseSpecies,
   evaluateSample,
@@ -24,9 +30,14 @@ import {
   generateSiteState,
   getPhenologyWindow,
   getPlantPresentation,
+  getRestorationSeasonFactor,
   getStatus,
   getSuitability,
   nextSeason,
+  planRestoration,
+  RestorationError,
+  RESTORATION_ACTION_LABELS,
+  RESTORATION_ACTION_POINTS,
   round,
   SPECIES_BY_ID,
   SITES,
@@ -34,7 +45,7 @@ import {
   type SiteState,
   type SpeciesState
 } from '@shanhai/game-core';
-import type { Store } from '../db/store.ts';
+import { Store } from '../db/store.ts';
 import { config } from '../config.ts';
 import { AppError } from '../errors.ts';
 
@@ -99,6 +110,19 @@ interface EventDraft {
   payload: Record<string, unknown>;
 }
 
+interface RestorationEffortRow {
+  id: string;
+  save_id: string;
+  year: number;
+  season: Season;
+  site_id: SiteId;
+  species_id: string;
+  action: RestorationAction;
+  resources_spent: number;
+  day: number;
+  created_at: string;
+}
+
 interface CommandOutcome {
   event: EventDraft;
   evaluation?: unknown;
@@ -121,13 +145,6 @@ const SAMPLE_LABELS: Record<SampleMethod, string> = {
   rubbing: '拓印',
   litter: '落叶采集',
   cutting: '标准剪取'
-};
-
-const RESTORATION_LABELS: Record<string, string> = {
-  reduce_disturbance: '降低区域干扰',
-  protect_seed_bank: '保留种子区',
-  restore_wetland: '恢复湿生带',
-  establish_plot: '设置长期观察样方'
 };
 
 export class GameService {
@@ -186,6 +203,7 @@ export class GameService {
       const save = this.getSaveOrThrow(saveId, sessionId);
       this.initializeYear(save);
       this.updateSave(save);
+      this.recordCheckpoint(save);
       return this.buildWorld(this.getSaveOrThrow(saveId, sessionId));
     });
   }
@@ -389,8 +407,8 @@ export class GameService {
       this.store.db
         .prepare(
           `INSERT INTO game_events
-           (id, save_id, sequence, type, message, effects_json, payload_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+           (id, save_id, sequence, type, message, effects_json, payload_json, command_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           event.id,
@@ -400,8 +418,12 @@ export class GameService {
           event.message,
           JSON.stringify(event.effects),
           JSON.stringify(outcome.event.payload),
+          JSON.stringify(request.command),
           event.createdAt
         );
+
+      // 检查点与命令在同一事务内提交；若后续步骤失败，整笔事务连同检查点一起回滚。
+      this.recordCheckpoint(save);
 
       const world = this.buildWorld(save);
       const response = { world, event, evaluation: outcome.evaluation ?? null };
@@ -488,9 +510,19 @@ export class GameService {
   private regenerateEnvironments(save: SaveRecord): void {
     const current = this.getSiteStates(save.id, save.year);
     const disturbance = new Map(current.map((state) => [state.siteId, state.disturbance]));
+    // 本季已落地的湿生带修复按施工日顺序持续作用于区域土壤，跨日重生成时按命令历史确定性重放。
+    const soilBonus = new Map<SiteId, number>();
+    for (const effort of this.getRestorationEfforts(save.id, save.year, save.season)) {
+      if (effort.day <= save.day) {
+        soilBonus.set(
+          effort.site_id,
+          round((soilBonus.get(effort.site_id) ?? 0) + 8 * getRestorationSeasonFactor(effort.action, save.season), 1)
+        );
+      }
+    }
     const environmentBySite = new Map<SiteId, SiteState>();
     for (const site of SITES) {
-      const state = generateSiteState(
+      const generated = generateSiteState(
         save.id,
         save.seed,
         save.year,
@@ -499,6 +531,9 @@ export class GameService {
         site.id,
         disturbance.get(site.id) ?? 0.08
       );
+      const state: SiteState = soilBonus.has(site.id)
+        ? { ...generated, soilMoisture: clamp(generated.soilMoisture + (soilBonus.get(site.id) ?? 0), 18, 96) }
+        : generated;
       this.upsertSiteState(state);
       this.recordEnvironmentHistory(state, save.season, save.day);
       environmentBySite.set(site.id, state);
@@ -762,35 +797,115 @@ export class GameService {
     if (!definition || !state || !site || state.population <= 1) {
       throw new AppError('SPECIES_NOT_VISIBLE', '当前区域没有可修复的目标物种', 409);
     }
-    if (action === 'restore_wetland' && save.current_site_id !== 'stream_valley') {
-      throw new AppError('ACTION_NOT_ALLOWED', '恢复湿生带只能在溪谷湿地执行', 409);
-    }
-    if (save.action_points < 2) {
-      throw new AppError('NO_ACTION_POINTS', '生态修复需要 2 个行动点', 409);
+    if (save.action_points < RESTORATION_ACTION_POINTS) {
+      throw new AppError('NO_ACTION_POINTS', `生态修复需要 ${RESTORATION_ACTION_POINTS} 个行动点`, 409);
     }
 
-    const profile = definition.zones[save.current_site_id]!;
-    if (action === 'reduce_disturbance' || action === 'restore_wetland') {
-      site.disturbance = Math.max(0, site.disturbance - (action === 'restore_wetland' ? 0.1 : 0.07));
-      state.health = Math.min(100, state.health + 3);
+    const siteId = save.current_site_id;
+    const profile = definition.zones[siteId]!;
+    const budgetSpent = this.getRestorationBudgetSpent(save.id, save.year, save.season);
+    const alreadyApplied = this.hasRestorationEffort(save.id, save.year, save.season, siteId, action);
+
+    let impact;
+    try {
+      impact = planRestoration({
+        action,
+        season: save.season,
+        site,
+        target: state,
+        carryingCapacity: profile.carryingCapacity,
+        budgetSpent,
+        alreadyAppliedThisSeason: alreadyApplied
+      });
+    } catch (error) {
+      if (error instanceof RestorationError) {
+        // 纯函数评估失败：此时尚未写入任何状态，事务回滚后存档保持原样。
+        throw new AppError('RESTORATION_NOT_AVAILABLE', error.message, 409);
+      }
+      throw error;
     }
-    if (action === 'protect_seed_bank') {
-      state.seedBank = Math.min(profile.carryingCapacity * 1.8, state.seedBank + profile.carryingCapacity * 0.1);
+
+    // 效果作用于区域与同区全部现存物种，再写修复措施占用（UNIQUE 约束兜底并发重复加成）。
+    const cohabitants = this.getSpeciesStates(save.id, save.year).filter(
+      (item) => item.siteId === siteId && item.population > 1
+    );
+    const applied = applyRestoration(site, cohabitants, speciesId, impact, (item) => {
+      const itemDefinition = SPECIES_BY_ID.get(item.speciesId);
+      return itemDefinition?.zones[siteId]?.carryingCapacity;
+    });
+    this.upsertSiteState(applied.site);
+    for (const nextState of applied.states) {
+      this.upsertSpeciesState(nextState);
     }
-    if (action === 'establish_plot') {
-      state.health = Math.min(100, state.health + 2);
-      state.seedBank = Math.min(profile.carryingCapacity * 1.8, state.seedBank + profile.carryingCapacity * 0.04);
+
+    const createdAt = new Date().toISOString();
+    try {
+      this.store.db
+        .prepare(
+          `INSERT INTO restoration_efforts
+           (id, save_id, year, season, site_id, species_id, action, resources_spent, day, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          randomUUID(),
+          save.id,
+          save.year,
+          save.season,
+          siteId,
+          speciesId,
+          action,
+          impact.cost,
+          save.day,
+          createdAt
+        );
+    } catch (error) {
+      // 并发请求抢先占用同一（季/区域/措施）槽位时不叠加收益，抛出后由事务整体回滚。
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes('UNIQUE constraint failed')) {
+        throw error;
+      }
+      throw new AppError(
+        'RESTORATION_ALREADY_PLANNED',
+        '该区域本季已经执行过相同修复，季节资源未被重复扣除',
+        409,
+        undefined,
+        true
+      );
     }
-    state.status = getStatus(state.population, profile.carryingCapacity, state.health);
-    this.upsertSiteState(site);
-    this.upsertSpeciesState(state);
-    this.consumeAction(save, 2);
+
+    const targetAfter = applied.states.find((item) => item.speciesId === speciesId)!;
+    const spilloverCount = applied.states.filter(
+      (item) => item.speciesId !== speciesId && (impact.cohabitants.healthDelta !== 0 || impact.cohabitants.seedBankDelta !== 0)
+    ).length;
+
+    this.consumeAction(save, RESTORATION_ACTION_POINTS);
     return {
       event: {
         type: 'RESTORE_HABITAT',
-        message: `${RESTORATION_LABELS[action]}：${definition.name}`,
-        effects: ['区域干扰下降或繁殖条件改善', '修复效果会在后续季节或年度显现', '消耗 2 个行动点'],
-        payload: { speciesId, action, siteId: save.current_site_id }
+        message: `${RESTORATION_ACTION_LABELS[action]}：${definition.name}`,
+        effects: [
+          ...impact.messages,
+          `区域干扰 ${formatSigned(impact.site.disturbanceDelta * 100)}%`,
+          `目标健康 ${formatSigned(impact.target.healthDelta)}`,
+          spilloverCount > 0 ? `同区 ${spilloverCount} 个物种获得庇护收益` : '同区其他物种本季无需额外庇护',
+          `消耗 ${RESTORATION_ACTION_POINTS} 个行动点`
+        ],
+        payload: {
+          speciesId,
+          action,
+          siteId,
+          cost: impact.cost,
+          seasonFactor: impact.seasonFactor,
+          budgetRemaining: round(SEASONAL_RESTORATION_BUDGET - budgetSpent - impact.cost, 1),
+          effects: {
+            site: impact.site,
+            target: {
+              health: round(targetAfter.health - state.health, 1),
+              seedBank: round(targetAfter.seedBank - state.seedBank, 2)
+            },
+            cohabitants: impact.cohabitants
+          }
+        }
       }
     };
   }
@@ -972,6 +1087,13 @@ export class GameService {
     } else {
       changes.push('本季没有错误采集记录。');
     }
+    const seasonEfforts = this.getRestorationEfforts(save.id, save.year, save.season);
+    if (seasonEfforts.length > 0) {
+      const spent = round(seasonEfforts.reduce((sum, effort) => sum + Number(effort.resources_spent), 0), 1);
+      changes.push(
+        `本季执行 ${seasonEfforts.length} 项修复，占用季节资源 ${spent}/${SEASONAL_RESTORATION_BUDGET}，效果已作用于对应区域与物种。`
+      );
+    }
 
     const summary: SeasonReview = {
       year: save.year,
@@ -1125,6 +1247,22 @@ export class GameService {
       speciesBySite.set(state.siteId, list);
     }
 
+    const seasonEfforts = this.getRestorationEfforts(save.id, save.year, save.season);
+    const effortsBySite = new Map<SiteId, ActiveRestoration[]>();
+    for (const effort of seasonEfforts) {
+      const list = effortsBySite.get(effort.site_id) ?? [];
+      list.push({
+        action: effort.action,
+        label: RESTORATION_ACTION_LABELS[effort.action],
+        speciesId: effort.species_id,
+        speciesName: SPECIES_BY_ID.get(effort.species_id)?.name ?? effort.species_id,
+        resourcesSpent: Number(effort.resources_spent),
+        day: Number(effort.day)
+      });
+      effortsBySite.set(effort.site_id, list);
+    }
+    const restorationSpent = round(seasonEfforts.reduce((sum, effort) => sum + Number(effort.resources_spent), 0), 1);
+
     const sampleCounts = this.store.db
       .prepare(
         `SELECT species_id, method, COUNT(*) AS used
@@ -1171,7 +1309,8 @@ export class GameService {
           windSpeed: environment.windSpeed,
           disturbance: environment.disturbance
         },
-        species: states
+        species: states,
+        restorations: effortsBySite.get(site.id) ?? []
       };
     });
 
@@ -1206,6 +1345,11 @@ export class GameService {
       phase: save.phase,
       currentSiteId: save.current_site_id,
       restorationUnlocked: Boolean(save.restoration_unlocked),
+      restorationBudget: {
+        total: SEASONAL_RESTORATION_BUDGET,
+        spent: restorationSpent,
+        remaining: round(SEASONAL_RESTORATION_BUDGET - restorationSpent, 1)
+      },
       sites,
       recentEvents,
       seasonReview: seasonSummaryRow ? parseJson<SeasonReview>(seasonSummaryRow.summary_json, null as unknown as SeasonReview) : null,
@@ -1473,6 +1617,253 @@ export class GameService {
       ).count
     );
   }
+
+  private getRestorationEfforts(saveId: string, year: number, season: Season): RestorationEffortRow[] {
+    return this.store.db
+      .prepare(
+        `SELECT * FROM restoration_efforts
+         WHERE save_id = ? AND year = ? AND season = ?
+         ORDER BY day ASC, created_at ASC`
+      )
+      .all(saveId, year, season) as unknown as RestorationEffortRow[];
+  }
+
+  private getRestorationBudgetSpent(saveId: string, year: number, season: Season): number {
+    const row = this.store.db
+      .prepare(
+        `SELECT COALESCE(SUM(resources_spent), 0) AS spent
+         FROM restoration_efforts WHERE save_id = ? AND year = ? AND season = ?`
+      )
+      .get(saveId, year, season) as unknown as { spent: number };
+    return round(Number(row.spent), 1);
+  }
+
+  private hasRestorationEffort(
+    saveId: string,
+    year: number,
+    season: Season,
+    siteId: SiteId,
+    action: RestorationAction
+  ): boolean {
+    const row = this.store.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM restoration_efforts
+         WHERE save_id = ? AND year = ? AND season = ? AND site_id = ? AND action = ?`
+      )
+      .get(saveId, year, season, siteId, action) as unknown as { count: number };
+    return Number(row.count) > 0;
+  }
+
+  private recordCheckpoint(save: SaveRecord): void {
+    this.store.db
+      .prepare(
+        `INSERT OR REPLACE INTO state_checkpoints (save_id, revision, sites_json, species_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(
+        save.id,
+        save.revision,
+        JSON.stringify(this.getSiteStates(save.id, save.year)),
+        JSON.stringify(this.getSpeciesStates(save.id, save.year)),
+        save.updated_at
+      );
+  }
+
+  /**
+   * 历史操作重放：用同一 seed 在隔离的内存库中从 revision 0 出发，按顺序重放全部命令，
+   * 并与已提交检查点逐版本比对。纯只读，不触碰当前存档；任何不确定结果都会显形为 mismatch。
+   */
+  replayHistory(sessionId: string, saveId: string): ReplayReport {
+    const save = this.getSaveOrThrow(saveId, sessionId);
+    const zero = this.store.db
+      .prepare('SELECT sites_json, species_json FROM state_checkpoints WHERE save_id = ? AND revision = 0')
+      .get(saveId) as unknown as { sites_json: string; species_json: string } | undefined;
+    if (!zero) {
+      throw new AppError('REPLAY_UNAVAILABLE', '该档案缺少 revision 0 初始检查点，无法重放', 409);
+    }
+
+    const eventRows = this.store.db
+      .prepare(
+        `SELECT sequence, command_json FROM game_events
+         WHERE save_id = ? ORDER BY sequence ASC`
+      )
+      .all(saveId) as unknown as Array<{ sequence: number; command_json: string | null }>;
+
+    // 隔离内存库重放：避免污染真实存档，也不依赖真实会话 Cookie。
+    const replayStore = new Store(':memory:');
+    try {
+      const replayService = new GameService(replayStore);
+      const replaySessionId = 'replay-session';
+      replayStore.db
+        .prepare('INSERT INTO sessions (id, token_hash, created_at, last_seen_at) VALUES (?, ?, ?, ?)')
+        .run(replaySessionId, 'replay', new Date().toISOString(), new Date().toISOString());
+      replayService.bootstrapReplaySave(replaySessionId, saveId, save.seed);
+
+      const checkpointRows = this.store.db
+        .prepare('SELECT revision, sites_json, species_json FROM state_checkpoints WHERE save_id = ? ORDER BY revision ASC')
+        .all(saveId) as unknown as Array<{ revision: number; sites_json: string; species_json: string }>;
+      const checkpoints = new Map(checkpointRows.map((row) => [row.revision, row]));
+
+      const mismatches: ReplayMismatch[] = [];
+      let replayed = 0;
+      for (const row of eventRows) {
+        const command = row.command_json ? parseJson<GameCommand | null>(row.command_json, null) : null;
+        if (!command) {
+          continue;
+        }
+        const revision = row.sequence;
+        let replayWorld: WorldSnapshot;
+        try {
+          replayWorld = replayService.executeCommand(replaySessionId, saveId, {
+            expectedRevision: revision - 1,
+            idempotencyKey: `replay-${saveId.slice(0, 8)}-${row.sequence}`,
+            command
+          }).world as WorldSnapshot;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          mismatches.push({
+            scope: 'save',
+            key: `command@${revision}`,
+            field: command.type,
+            expected: 'command replays successfully',
+            actual: `replay aborted: ${message}`
+          });
+          break;
+        }
+        replayed += 1;
+
+        const checkpoint = checkpoints.get(revision);
+        if (checkpoint) {
+          const expectedSites = parseJson<SiteState[]>(checkpoint.sites_json, []);
+          const expectedSpecies = parseJson<SpeciesState[]>(checkpoint.species_json, []);
+          const actualSites = replayStore.db
+            .prepare('SELECT * FROM site_states WHERE save_id = ? AND year = ? ORDER BY site_id')
+            .all(saveId, replayWorld.year) as unknown as Array<Record<string, unknown>>;
+          const actualSpeciesRows = replayStore.db
+            .prepare('SELECT * FROM species_states WHERE save_id = ? AND year = ? ORDER BY site_id, species_id')
+            .all(saveId, replayWorld.year) as unknown as Array<Record<string, unknown>>;
+          mismatches.push(
+            ...this.diffReplaySites(expectedSites, actualSites, revision),
+            ...this.diffReplaySpecies(expectedSpecies, actualSpeciesRows, revision)
+          );
+        }
+      }
+
+      const finalRevision = checkpointRows[checkpointRows.length - 1]?.revision ?? 0;
+      return {
+        replayedCommands: replayed,
+        finalRevision,
+        matches: mismatches.length === 0,
+        mismatchCount: mismatches.length,
+        mismatches: mismatches.slice(0, 50),
+        checkedAt: new Date().toISOString()
+      };
+    } finally {
+      replayStore.close();
+    }
+  }
+
+  /** 仅供重放使用：以与真实存档相同的 id/seed 创建内存存档，预解锁修复以完整重放历史。 */
+  private bootstrapReplaySave(sessionId: string, saveId: string, seed: string): void {
+    this.store.transaction(() => {
+      const now = new Date().toISOString();
+      this.store.db
+        .prepare(
+          `INSERT INTO saves (
+            id, session_id, seed, revision, year, season, day, slot, action_points, phase,
+            current_site_id, year_start_species_json, year_start_sites_json,
+            restoration_unlocked, created_at, updated_at
+          ) VALUES (?, ?, ?, 0, 1, 'spring', 1, 1, 30, 'active', 'foothill', '[]', '[]', 1, ?, ?)`
+        )
+        .run(saveId, sessionId, seed, now, now);
+      const save = this.getSaveOrThrow(saveId, sessionId);
+      this.initializeYear(save);
+      this.updateSave(save);
+      this.recordCheckpoint(save);
+    });
+  }
+
+  private diffReplaySites(
+    expected: SiteState[],
+    actualRows: Array<Record<string, unknown>>,
+    revision: number
+  ): ReplayMismatch[] {
+    const mismatches: ReplayMismatch[] = [];
+    const actualBySite = new Map(actualRows.map((row) => [String(row.site_id), row]));
+    if (expected.length !== actualRows.length) {
+      mismatches.push({
+        scope: 'count',
+        key: `sites@${revision}`,
+        expected: expected.length,
+        actual: actualRows.length
+      });
+    }
+    for (const site of expected) {
+      const row = actualBySite.get(site.siteId);
+      if (!row) {
+        mismatches.push({ scope: 'site', key: `${site.siteId}@${revision}`, expected: 'present', actual: 'missing' });
+        continue;
+      }
+      for (const field of ['temperature_c', 'humidity', 'soil_moisture', 'light_lux', 'wind_speed', 'disturbance'] as const) {
+        const actual = Number(row[field]);
+        const wanted = siteToRowValue(site, field);
+        if (!closeEnough(wanted, actual, field === 'light_lux' ? 1 : 0.011)) {
+          mismatches.push({
+            scope: 'site',
+            key: `${site.siteId}@${revision}`,
+            field,
+            expected: wanted,
+            actual
+          });
+        }
+      }
+    }
+    return mismatches;
+  }
+
+  private diffReplaySpecies(
+    expected: SpeciesState[],
+    actualRows: Array<Record<string, unknown>>,
+    revision: number
+  ): ReplayMismatch[] {
+    const mismatches: ReplayMismatch[] = [];
+    const actualByKey = new Map(actualRows.map((row) => [`${String(row.site_id)}:${String(row.species_id)}`, row]));
+    if (expected.length !== actualRows.length) {
+      mismatches.push({
+        scope: 'count',
+        key: `species@${revision}`,
+        expected: expected.length,
+        actual: actualRows.length
+      });
+    }
+    for (const state of expected) {
+      const key = `${state.siteId}:${state.speciesId}`;
+      const row = actualByKey.get(key);
+      if (!row) {
+        mismatches.push({ scope: 'species', key: `${key}@${revision}`, expected: 'present', actual: 'missing' });
+        continue;
+      }
+      for (const field of ['population', 'health', 'seed_bank', 'suitability'] as const) {
+        const actual = Number(row[field]);
+        const wanted = stateToRowValue(state, field);
+        if (!closeEnough(wanted, actual, 0.011)) {
+          mismatches.push({ scope: 'species', key: `${key}@${revision}`, field, expected: wanted, actual });
+        }
+      }
+      const expectedPhenology = JSON.stringify(state.phenology);
+      const actualPhenology = String(row.phenology_json);
+      if (expectedPhenology !== actualPhenology) {
+        mismatches.push({
+          scope: 'species',
+          key: `${key}@${revision}`,
+          field: 'phenology',
+          expected: expectedPhenology,
+          actual: actualPhenology
+        });
+      }
+    }
+    return mismatches;
+  }
 }
 
 function rowToSiteState(row: SiteStateRow): SiteState {
@@ -1591,6 +1982,43 @@ function worstStatus(left: string, right: string): string {
     absent: 4
   };
   return (severity[right] ?? 1) > (severity[left] ?? 1) ? right : left;
+}
+
+function closeEnough(left: number, right: number, tolerance: number): boolean {
+  return Math.abs(left - right) <= tolerance;
+}
+
+function siteToRowValue(site: SiteState, field: 'temperature_c' | 'humidity' | 'soil_moisture' | 'light_lux' | 'wind_speed' | 'disturbance'): number {
+  switch (field) {
+    case 'temperature_c':
+      return site.temperatureC;
+    case 'humidity':
+      return site.humidity;
+    case 'soil_moisture':
+      return site.soilMoisture;
+    case 'light_lux':
+      return site.lightLux;
+    case 'wind_speed':
+      return site.windSpeed;
+    case 'disturbance':
+      return site.disturbance;
+  }
+}
+
+function stateToRowValue(
+  state: SpeciesState,
+  field: 'population' | 'health' | 'seed_bank' | 'suitability'
+): number {
+  switch (field) {
+    case 'population':
+      return state.population;
+    case 'health':
+      return state.health;
+    case 'seed_bank':
+      return state.seedBank;
+    case 'suitability':
+      return state.suitability;
+  }
 }
 
 export { CATALOG_VERSION };
